@@ -6,6 +6,12 @@
 
 #include "../../config.h"
 
+#ifdef linux
+	#ifndef _GNU_SOURCE
+	#define _GNU_SOURCE	/* memfd_create(), MFD_CLOEXEC, MFD_ALLOW_SEALING */
+	#endif
+#endif
+
 #include <core/gp_debug.h>
 #include <core/gp_pixmap.h>
 #include <utils/gp_utf.h>
@@ -49,6 +55,13 @@ randname(char *buf)
 static int
 create_shm_file(void)
 {
+#ifdef linux
+	int fd = memfd_create("frame", MFD_CLOEXEC|MFD_ALLOW_SEALING);
+	if (fd < 0) {
+		GP_ABORT("memfd_create() failed for new shm file");
+	}
+	return fd;
+#else
 	int retries = 100;
 	do {
 		char name[] = "/wl_shm-XXXXXX";
@@ -61,6 +74,7 @@ create_shm_file(void)
 		}
 	} while (retries > 0 && errno == EEXIST);
 	return -1;
+#endif
 }
 
 static int
@@ -75,6 +89,7 @@ allocate_shm_file(size_t size)
 	} while (ret < 0 && errno == EINTR);
 	if (ret < 0) {
 		close(fd);
+		GP_ABORT("ftruncate() failed for frame shm file");
 		return -1;
 	}
 	return fd;
@@ -121,45 +136,158 @@ struct client_state {
 
 static struct client_state state = {};
 
+// Describes a buffer where a rendered frame can reside.
 struct buffered_frame {
 	int width;
 	int height;
 	uint32_t* data;
 	struct wl_buffer* buffer;
+	struct wl_buffer_listener listener;
+	int busy;
 };
 
-static struct buffered_frame frame = {};
-
-static int buffered_frame_init(struct client_state* state, struct buffered_frame *frame)
+// Called by wayland runtime to indicate the frame is no more in use.
+static void on_frame_release(void* self, UN(struct wl_buffer* buffer))
 {
-	const int stride = state->w * 4;
-	const int size = stride * state->h;
+	struct buffered_frame* frame = (struct buffered_frame*) self;
+	GP_ASSERT(frame);
+	GP_ASSERT(frame->busy == 1);
+	frame->busy = 0;
+}
+
+const uint32_t MAX_FRAME_WIDTH = 16384;
+const uint32_t MAX_FRAME_HEIGHT = 16384;
+
+static struct buffered_frame* buffered_frame_create(
+		uint32_t width, uint32_t height,
+		struct wl_shm* shm)
+{
+	GP_ASSERT(shm);
+	GP_ASSERT(width <= MAX_FRAME_WIDTH);
+	GP_ASSERT(height <= MAX_FRAME_HEIGHT);
+
+	const int stride = width * 4;
+	const int size = stride * height;
 
 	int fd = allocate_shm_file(size);
 	if (fd == -1) {
-		return 0;
+		GP_ABORT("allocate_shm_file() failed");
 	}
 
 	uint32_t *data = mmap(NULL, size,
 			PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (data == MAP_FAILED) {
 		close(fd);
-		return 0;
+		GP_ABORT("mmap() failed for newly allocated frame");
 	}
 
-	struct wl_shm_pool *pool = wl_shm_create_pool(state->shm, fd, size);
-
+	// allocate buffer from a pool that can be destroyed immediately after
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
 	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
-			state->w, state->h, stride, WL_SHM_FORMAT_XRGB8888);
-
+			width, height, stride, WL_SHM_FORMAT_XRGB8888);
 	wl_shm_pool_destroy(pool);
 	close(fd);
 
-	frame->width = state->w;
-	frame->height = state->h;
+	struct buffered_frame* frame = calloc(1, sizeof(struct buffered_frame));
+
+	frame->width = width;
+	frame->height = height;
 	frame->data = data;
 	frame->buffer = buffer;
-	return 1;
+	frame->busy = 0;
+
+	// install a callback to inform us when the frame can be reused
+	frame->listener.release = on_frame_release;
+	wl_buffer_add_listener(buffer, &frame->listener, frame);
+
+	return frame;
+}
+
+static void buffered_frame_destroy(struct buffered_frame *frame)
+{
+	if (!frame) { return; }
+
+	GP_ASSERT(!frame->busy);
+
+	if (frame->buffer) {
+		wl_buffer_destroy(frame->buffer);
+	}
+	if (frame->data) {
+		munmap(frame->data, frame->width * frame->height * 4);
+	}
+	free(frame);
+}
+
+#define MAX_BUFFERED_FRAMES 16
+
+static struct buffered_frame* buffered_frames[MAX_BUFFERED_FRAMES] = { 0 };
+
+static struct buffered_frame* give_unused_frame(struct client_state* state)
+{
+	for (int i=0; i<MAX_BUFFERED_FRAMES; i++) {
+		struct buffered_frame* frame = buffered_frames[i];
+		if (frame && !frame->busy) {
+
+			// primarily attempt to reuse existing frames, but only
+			// if they have the same width and height as the window
+			if (frame->width == state->w && frame->height == state->h) {
+
+				// this frame is reusable immediately
+				return frame;
+			}
+			else {
+
+				// this frame is not busy and has incorrect w/h,
+				// recycle it and return a new one
+				buffered_frame_destroy(frame);
+				frame = buffered_frame_create(state->w, state->h, state->shm);
+				return frame;
+			}
+		}
+	}
+	// no free frames, create one
+	for (int i=0; i<MAX_BUFFERED_FRAMES; i++) {
+		struct buffered_frame* frame = buffered_frames[i];
+		if (!frame) {
+			frame = buffered_frame_create(state->w, state->h, state->shm);
+			return frame;
+		}
+	}
+	GP_ABORT("All buffered frames are in use, this should not happen");
+}
+
+static void commit_frame(struct buffered_frame* frame)
+{
+	GP_ASSERT(frame);
+	GP_ASSERT(!frame->busy);
+	frame->busy = 1;
+	wl_surface_attach(state.surface, frame->buffer, state.w, state.h);
+	wl_surface_damage(state.surface, 0, 0, state.w, state.h);
+	wl_surface_commit(state.surface);
+	wl_display_flush(state.display);
+}
+
+struct buffered_frame* current_frame = NULL;
+
+static void
+make_frame_current(gp_backend* backend, struct buffered_frame* frame)
+{
+	GP_ASSERT(frame);
+	GP_ASSERT(!frame->busy);
+	const int pixmap_size = frame->height * frame->width * 4;
+	current_frame = frame;
+	backend->pixmap->pixels = (uint8_t*)frame->data;
+}
+
+static void
+make_frame_current_and_clear(gp_backend* backend, struct buffered_frame* frame)
+{
+	GP_ASSERT(frame);
+	GP_ASSERT(!frame->busy);
+	const int pixmap_size = frame->height * frame->width * 4;
+	memset(frame->data, 0, pixmap_size);
+	current_frame = frame;
+	backend->pixmap->pixels = (uint8_t*)frame->data;
 }
 
 static void
@@ -625,11 +753,16 @@ static int window_create(struct client_state *state, unsigned int w, unsigned in
 		zxdg_toplevel_decoration_v1_add_listener(state->decoration, &decoration_listener, state);
 		zxdg_toplevel_decoration_v1_set_mode(state->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 	}
+	else {
+		GP_WARN("No Wayland decoration manager found");
+	}
 
-	buffered_frame_init(state, &frame);
-
-	wl_surface_attach(state->surface, frame.buffer, state->w, state->h);
-	wl_surface_commit(state->surface);
+	// in Wayland, window must have a frame attached to be shown;
+	// attach an empty frame so that we have something,
+	// and then select another empty frame as current so we can draw
+	make_frame_current_and_clear(state->backend, give_unused_frame(state));
+	commit_frame(current_frame);
+	make_frame_current_and_clear(state->backend, give_unused_frame(state));
 
 	return 0;
 }
@@ -638,13 +771,8 @@ static void wayland_flip(gp_backend *self)
 {
 	(void) self;
 
-	//TODO: we need two buffers and swap the backend->pixmap on attach
-	//      so that we avoid drawing into a memory that is currently
-	//      attached to surface
-	wl_surface_attach(state.surface, frame.buffer, state.w, state.h);
-	wl_surface_damage(state.surface, 0, 0, state.w, state.h);
-	wl_surface_commit(state.surface);
-	wl_display_flush(state.display);
+	commit_frame(current_frame);
+	make_frame_current_and_clear(self, give_unused_frame(&state));
 }
 
 
@@ -652,10 +780,8 @@ static void wayland_update_rect(gp_backend* self, gp_coord x, gp_coord y, gp_coo
 {
 	(void) self;
 
-	wl_surface_attach(state.surface, frame.buffer, state.w, state.h);
-	wl_surface_damage(state.surface, x, y, w, h);
-	wl_surface_commit(state.surface);
-	wl_display_flush(state.display);
+	commit_frame(current_frame);
+	make_frame_current(self, give_unused_frame(&state));
 }
 
 static int wayland_set_attr(gp_backend* self, enum gp_backend_attrs attrs, const void* values)
@@ -725,17 +851,15 @@ gp_backend *gp_wayland_init(const char *display,
 		return NULL;
 	}
 
+	state.backend = &backend;
+
+	backend.pixmap = gp_pixmap_alloc(w, h, state.pixel_type);	/* FIXME: possible leak */
+
 	if (window_create(&state, w, h, caption)) {
 		gp_poll_rem(&backend.fds, &state.fd);
 		display_disconnect(&state);
 		return NULL;
 	}
-
-	state.backend = &backend;
-
-	backend.pixmap = gp_pixmap_alloc(w, h, state.pixel_type);
-
-	backend.pixmap->pixels = (void*)frame.data;
 
 	backend.event_queue = &state.ev_queue;
 
