@@ -6,10 +6,8 @@
 
 #include "../../config.h"
 
-#ifdef linux
-	#ifndef _GNU_SOURCE
-	#define _GNU_SOURCE	/* memfd_create(), MFD_CLOEXEC, MFD_ALLOW_SEALING */
-	#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE	/* memfd_create(), MFD_CLOEXEC, MFD_ALLOW_SEALING */
 #endif
 
 #include <core/gp_debug.h>
@@ -276,7 +274,7 @@ make_frame_current(gp_backend* backend, struct buffered_frame* frame)
 	GP_ASSERT(!frame->busy);
 	const int pixmap_size = frame->height * frame->width * 4;
 	current_frame = frame;
-	backend->pixmap->pixels = (uint8_t*)frame->data;
+	//backend->pixmap->pixels = (uint8_t*)frame->data;
 }
 
 static void
@@ -287,7 +285,7 @@ make_frame_current_and_clear(gp_backend* backend, struct buffered_frame* frame)
 	const int pixmap_size = frame->height * frame->width * 4;
 	memset(frame->data, 0, pixmap_size);
 	current_frame = frame;
-	backend->pixmap->pixels = (uint8_t*)frame->data;
+	//backend->pixmap->pixels = (uint8_t*)frame->data;
 }
 
 static void
@@ -771,6 +769,20 @@ static void wayland_flip(gp_backend *self)
 {
 	(void) self;
 
+	gp_pixmap* source = self->pixmap;
+	if (current_frame->width == (uint32_t)source->w && current_frame->height == (uint32_t)source->h) {
+		uint32_t size = (uint32_t)source->w * (uint32_t)source->h * 4;
+		memcpy(current_frame->data, self->pixmap->pixels, size);
+	}
+	else {
+		for (uint32_t y=0; y<(uint32_t)source->h; y++) {
+			if (y>=(uint32_t)current_frame->height) break;
+			memcpy(current_frame->data,
+				self->pixmap->pixels + y*source->w*4,
+				GP_MIN((uint32_t)self->pixmap->w, (uint32_t)current_frame->width)*4);
+		}
+	}
+
 	commit_frame(current_frame);
 	make_frame_current_and_clear(self, give_unused_frame(&state));
 }
@@ -778,10 +790,12 @@ static void wayland_flip(gp_backend *self)
 
 static void wayland_update_rect(gp_backend* self, gp_coord x, gp_coord y, gp_coord w, gp_coord h)
 {
-	(void) self;
+	wayland_flip(self);
 
+/*
 	commit_frame(current_frame);
 	make_frame_current(self, give_unused_frame(&state));
+*/
 }
 
 static int wayland_set_attr(gp_backend* self, enum gp_backend_attrs attrs, const void* values)
