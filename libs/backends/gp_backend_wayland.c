@@ -220,17 +220,26 @@ static struct buffered_frame* buffered_frame_create(struct client_state* state, 
 static struct buffered_frame* get_next_free_frame(struct client_state* state)
 {
 	for (int i=0; i<MAX_PENDING_FRAMES; i++) {
-		if (state->frames[i] && !state->frames[i]->busy) {
-			return state->frames[i];
+		struct buffered_frame* frame = state->frames[i];
+		if (frame && !frame->busy) {
+			if (frame->width != state->w || frame->height != state->h) {
+				fprintf(stderr, "wayland: recuperating frame #%d, changed size (%dx%d, we need %dx%d)\n", i, frame->width, frame->height, state->w, state->h);
+				buffered_frame_destroy(frame);
+				frame = buffered_frame_create(state, state->w, state->h);
+				state->frames[i] = frame;
+			}
+			return frame;
 		}
 	}
 	for (int i=0; i<MAX_PENDING_FRAMES; i++) {
-		if (state->frames[i] == NULL) {
-			state->frames[i] = buffered_frame_create(state, state->w, state->h);
-			if (!state->frames[i])
+		struct buffered_frame* frame = state->frames[i];
+		if (!frame) {
+			frame = buffered_frame_create(state, state->w, state->h);
+			if (!frame)
 				return NULL;
 			fprintf(stderr, "wayland: created frame for slot #%d (%dx%d)\n", i, state->w, state->h);
-			return state->frames[i];
+			state->frames[i] = frame;
+			return frame;
 		}
 	}
 	GP_FATAL("wayland: all frames are busy, cannot create more (server lockup?)");
@@ -830,6 +839,10 @@ static void wayland_update(gp_backend *self)
 
 static void wayland_update_rect(gp_backend* self, gp_coord x, gp_coord y, gp_coord w, gp_coord h)
 {
+	/* so far, we are not able to redraw only part, we need to switch the whole frame */
+	return wayland_update(self);
+
+#if 0
 	gp_backend* backend = self;
 
 	state.current_frame->busy = true;
@@ -843,6 +856,7 @@ static void wayland_update_rect(gp_backend* self, gp_coord x, gp_coord y, gp_coo
 	assert(state.current_frame->data);
 
 	backend->pixmap->pixels = (uint8_t*)(state.current_frame->data);
+#endif
 }
 
 static enum gp_backend_ret wayland_set_attr(gp_backend* self, enum gp_backend_attr attrs, const void* values)
@@ -950,6 +964,10 @@ gp_backend *gp_wayland_init(const char *display,
 	gp_ev_queue_init(backend.event_queue, w, h, 0, NULL, NULL, 0);
 
 	gp_ev_queue_push_pixel_type(backend.event_queue, state.pixel_type, 0);
+
+	/* initial update; Wayland needs to have the window redrawn at least once before
+	   it shows it on screen or in the panel */
+	wayland_update(state.backend);
 
 	return &backend;
 }
